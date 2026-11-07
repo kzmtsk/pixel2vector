@@ -1,6 +1,6 @@
 ---
 name: pixel2vector
-description: Raster görseli (PNG/JPG/WebP) vektöre çevirir — logo, illüstrasyon, çizim/mühür, fotoğraf. Önce görseli sınıflandırır, çıktı hedefini sorar, SVG/PDF/EPS/DXF üretir ve sonucu ölçerek doğrular.
+description: Converts raster images (PNG/JPG/WebP) to vectors (SVG/PDF/EPS/DXF) — logos, illustrations, line art, photos; classifies, asks the output target, verifies. Raster görseli vektöre çevirir.
 ---
 
 # pixel2vector
@@ -18,7 +18,7 @@ from anti-aliasing (the source is upscaled before quantisation). Smooth colour t
 rebuilt as real gradients — linear at any angle or radial at any centre, any number of stops, one
 gradient per shape or one shared across several shapes — instead of being posterised into bands.
 
-Talk to the user in their language (Turkish for Kazım). Keep narration minimal.
+Talk to the user in their own language. Keep narration minimal.
 
 ## 0. Engine setup (once per session)
 
@@ -58,11 +58,12 @@ with `--gradients off` when the user wants flat colours only.
 
 Use AskUserQuestion (multiSelect). Never skip this, even if the target seems obvious.
 
-Question: "Vektör çıktısı nereye gidecek?" Options:
-1. **Baskı (PDF/EPS)** — offset/dijital baskı
-2. **Kesim / lazer / plotter (DXF)**
-3. **Web / ekran (SVG)**
-4. **Illustrator / InDesign'da düzenleme**
+Ask, in the user's language, where the vector is going (e.g. EN "Where will the vector be used?",
+TR "Vektör çıktısı nereye gidecek?"). Options:
+1. **Print (PDF/EPS)** — offset / digital print · *Baskı*
+2. **Cutting / laser / plotter (DXF)** · *Kesim / lazer / plotter*
+3. **Web / screen (SVG)** · *Web / ekran*
+4. **Editing in Illustrator / InDesign** · *Illustrator / InDesign'da düzenleme*
 
 In the same AskUserQuestion call, add only the questions that are genuinely open:
 - Background: keep or remove — ask when the image has a solid background and the target is not
