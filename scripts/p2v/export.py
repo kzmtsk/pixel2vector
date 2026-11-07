@@ -17,7 +17,7 @@ from .imgio import to_hex
 
 class Scene:
     def __init__(self, W, H, s, palette, regions, chains, dropped_labels, mode="stacked",
-                 cmyk=None, pt_per_px=1.0, title="pixel2vector"):
+                 cmyk=None, pt_per_px=1.0, title="pixel2vector", gradients=None):
         self.W, self.H, self.s = W, H, s
         self.palette = palette
         self.regions = regions
@@ -27,6 +27,12 @@ class Scene:
         self.cmyk = {k.upper(): v for k, v in (cmyk or {}).items()}
         self.pt_per_px = pt_per_px
         self.title = title
+        self.gradients = gradients or {}
+        # one id per distinct gradient object (shared gradients are emitted once)
+        self.grad_ids = {}
+        for lab, g in self.gradients.items():
+            if id(g) not in self.grad_ids:
+                self.grad_ids[id(g)] = "grad%d" % (len(self.grad_ids) + 1)
         self.by_id = {r.id: r for r in regions}
         self.visible = [r for r in regions if r.label >= 0 and r.label not in self.dropped]
         order = sorted(self.visible, key=lambda r: -r.area)
@@ -86,6 +92,37 @@ def _f(v):
 
 
 # ================================================================ SVG
+def _svg_fill(scene, label):
+    g = scene.gradients.get(label)
+    if g is None:
+        return scene.hexcol(label)
+    return "url(#%s)" % scene.grad_ids[id(g)]
+
+
+def _svg_defs(scene):
+    if not scene.gradients:
+        return []
+    k = scene.s
+    out = ["<defs>"]
+    done = set()
+    for g in scene.gradients.values():
+        if id(g) in done:
+            continue
+        done.add(id(g))
+        gid = scene.grad_ids[id(g)]
+        if g.kind == "linear":
+            out.append('<linearGradient id="%s" gradientUnits="userSpaceOnUse" x1="%s" y1="%s" x2="%s" y2="%s">' % (
+                gid, _f(g.p0[0] / k), _f(g.p0[1] / k), _f(g.p1[0] / k), _f(g.p1[1] / k)))
+        else:
+            out.append('<radialGradient id="%s" gradientUnits="userSpaceOnUse" cx="%s" cy="%s" r="%s">' % (
+                gid, _f(g.center[0] / k), _f(g.center[1] / k), _f(g.radius / k)))
+        for off, col in g.stops:
+            out.append('<stop offset="%s" stop-color="%s"/>' % (_f(off), to_hex(col)))
+        out.append("</linearGradient>" if g.kind == "linear" else "</radialGradient>")
+    out.append("</defs>")
+    return out
+
+
 def _svg_loop(segs, k):
     out = []
     first = True
@@ -135,6 +172,7 @@ def write_svg(scene, path):
     lines = ['<?xml version="1.0" encoding="UTF-8"?>',
              '<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="%d" height="%d" viewBox="0 0 %d %d">' % (W, H, W, H),
              '<title>%s</title>' % scene.title]
+    lines += _svg_defs(scene)
     if scene.mode == "outline":
         groups = {}
         for ch, lab in scene.outline_chains():
@@ -150,7 +188,8 @@ def write_svg(scene, path):
             groups.setdefault(r.label, []).append(r)
         for i, lab in enumerate(sorted(groups, key=lambda l: -sum(r.area for r in groups[l]))):
             hx = scene.hexcol(lab)
-            lines.append('<g id="color-%02d-%s" fill="%s" fill-rule="evenodd">' % (i + 1, hx[1:], hx))
+            gname = ("gradient-%02d" % (i + 1)) if lab in scene.gradients else ("color-%02d-%s" % (i + 1, hx[1:]))
+            lines.append('<g id="%s" fill="%s" fill-rule="evenodd">' % (gname, _svg_fill(scene, lab)))
             for r in groups[lab]:
                 d = "".join(_svg_loop(l.segs, k) for l in scene.loops_for(r))
                 lines.append('<path id="r%d" d="%s"/>' % (r.id, d))
@@ -159,7 +198,7 @@ def write_svg(scene, path):
         lines.append('<g id="stacked" fill-rule="evenodd">')
         for r in scene.paint_order:
             d = "".join(_svg_loop(l.segs, k) for l in scene.loops_for(r))
-            lines.append('<path id="r%d" class="c%s" fill="%s" d="%s"/>' % (r.id, scene.hexcol(r.label)[1:], scene.hexcol(r.label), d))
+            lines.append('<path id="r%d" class="c%s" fill="%s" d="%s"/>' % (r.id, scene.hexcol(r.label)[1:], _svg_fill(scene, r.label), d))
         lines.append("</g>")
     lines.append("</svg>")
     with open(path, "w", encoding="utf-8") as f:
@@ -241,6 +280,33 @@ def _pdf_path(cmds, k):
     return "\n".join(o)
 
 
+def _pdf_function(stops):
+    """Type 3 stitching function of Type 2 (linear) segments over the stops."""
+    def c(col):
+        return "[%s %s %s]" % tuple(_f(v) for v in col)
+    segs = []
+    for (o0, c0), (o1, c1) in zip(stops[:-1], stops[1:]):
+        segs.append("<< /FunctionType 2 /Domain [0 1] /C0 %s /C1 %s /N 1 >>" % (c(c0), c(c1)))
+    if len(segs) == 1:
+        return segs[0]
+    bounds = " ".join(_f(o) for o, _ in stops[1:-1])
+    enc = " ".join("0 1" for _ in segs)
+    return "<< /FunctionType 3 /Domain [0 1] /Functions [%s] /Bounds [%s] /Encode [%s] >>" % (
+        " ".join(segs), bounds, enc)
+
+
+def _shading_dict(g, k):
+    if g.kind == "linear":
+        coords = "%s %s %s %s" % (_f(g.p0[0] / k), _f(g.p0[1] / k), _f(g.p1[0] / k), _f(g.p1[1] / k))
+        st = 2
+    else:
+        coords = "%s %s 0 %s %s %s" % (_f(g.center[0] / k), _f(g.center[1] / k), _f(g.center[0] / k),
+                                       _f(g.center[1] / k), _f(g.radius / k))
+        st = 3
+    return "<< /ShadingType %d /ColorSpace /DeviceRGB /Coords [%s] /Function %s /Extend [true true] >>" % (
+        st, coords, _pdf_function(g.stops))
+
+
 def write_pdf(scene, path):
     k = scene.s
     W, H = scene.W, scene.H
@@ -258,19 +324,32 @@ def write_pdf(scene, path):
     else:
         regs = scene.paint_order if scene.mode == "stacked" else sorted(scene.visible, key=lambda r: r.label)
         for r in regs:
-            body.append(_fill_op_color(scene, r.label))
+            g = scene.gradients.get(r.label)
+            if g is None:
+                body.append(_fill_op_color(scene, r.label))
+            else:
+                body.append("q")
             for l in scene.loops_for(r):
                 body.append(_pdf_path(loop_to_cubics(l.segs), k))
-            body.append("f*")
+            if g is None:
+                body.append("f*")
+            else:
+                body.append("W* n /%s sh Q" % scene.grad_ids[id(g)].replace("grad", "Sh"))
     body.append("Q")
     content = ("\n".join(body)).encode("latin-1")
+    shades, done = [], set()
+    for g in scene.gradients.values():
+        if id(g) not in done:
+            done.add(id(g))
+            shades.append((scene.grad_ids[id(g)].replace("grad", "Sh"), _shading_dict(g, k)))
+    res = "<< /Shading << %s >> >>" % " ".join("/%s %d 0 R" % (nm, 6 + i) for i, (nm, _) in enumerate(shades)) if shades else "<< >>"
     objs = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        ("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %s %s] /Contents 4 0 R /Resources << >> >>" % (_f(W * sc), _f(H * sc))).encode(),
+        ("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %s %s] /Contents 4 0 R /Resources %s >>" % (_f(W * sc), _f(H * sc), res)).encode(),
         b"<< /Length " + str(len(content)).encode() + b" >>\nstream\n" + content + b"\nendstream",
         ("<< /Title (%s) /Producer (pixel2vector) /Creator (pixel2vector) >>" % scene.title).encode("latin-1", "replace"),
-    ]
+    ] + [d.encode() for _, d in shades]
     out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
     offs = []
     for i, o in enumerate(objs, 1):
@@ -328,6 +407,7 @@ def write_eps(scene, path):
     sc = scene.pt_per_px
     bw, bh = int(math.ceil(W * sc)), int(math.ceil(H * sc))
     L = ["%!PS-Adobe-3.0 EPSF-3.0",
+         "%%LanguageLevel: 3",
          "%%%%BoundingBox: 0 0 %d %d" % (bw, bh),
          "%%%%HiResBoundingBox: 0 0 %s %s" % (_f(W * sc), _f(H * sc)),
          "%%%%Title: %s" % scene.title,
@@ -353,11 +433,20 @@ def write_eps(scene, path):
     else:
         regs = scene.paint_order if scene.mode == "stacked" else sorted(scene.visible, key=lambda r: r.label)
         for r in regs:
-            L.append(col(r.label))
+            g = scene.gradients.get(r.label)
+            if g is None:
+                L.append(col(r.label))
+            else:
+                L.append("gsave")
             L.append("newpath")
             for l in scene.loops_for(r):
                 L.append(_eps_loop(l.segs, k))
-            L.append("eofill")
+            if g is None:
+                L.append("eofill")
+            else:
+                L.append("eoclip newpath")
+                L.append(_shading_dict(g, k) + " shfill")
+                L.append("grestore")
     L += ["grestore", "showpage", "%%EOF"]
     with open(path, "w", encoding="latin-1") as f:
         f.write("\n".join(L) + "\n")

@@ -10,7 +10,9 @@ colour regions is stored once and referenced by both neighbours, so shapes meet 
 gaps, no overlaps) and a cutter traces each edge once. Geometry is fitted with a primitive ladder —
 straight line → tangent fillet / circular arc → cubic Bézier — plus whole-shape circle and ellipse
 detection, corner detection with least-squares corner placement, and sub-pixel boundaries recovered
-from anti-aliasing (the source is upscaled before quantisation).
+from anti-aliasing (the source is upscaled before quantisation). Smooth colour transitions are
+rebuilt as real gradients — linear at any angle or radial at any centre, any number of stops, one
+gradient per shape or one shared across several shapes — instead of being posterised into bands.
 
 Talk to the user in their language (Turkish for Kazım). Keep narration minimal.
 
@@ -44,6 +46,10 @@ Category meaning:
 - **lineart** — monochrome drawing, stamp, signature, handwriting, scan of ink
 - **photo** — continuous tone; output is a posterised stylisation, not a faithful copy. Say so.
 
+Gradients are detected automatically for logo and illustration (`--gradients auto`). Force them with
+`--gradients on` (e.g. a photo-classified image that is really a gradient graphic) or switch them off
+with `--gradients off` when the user wants flat colours only.
+
 ## 2. Ask the output target — always, before processing
 
 Use AskUserQuestion (multiSelect). Never skip this, even if the target seems obvious.
@@ -72,7 +78,11 @@ after seeing the palette from the first run, via `--cmyk-map`.
 | Web | `--formats svg --mode stacked` | `.svg` |
 | Print | `--formats pdf,eps --mode stacked [--width-mm W] [--cmyk-map M]` | `.pdf`, `.eps` |
 | Cutting | `--formats dxf,svg --mode outline --background remove [--width-mm W]` | `.dxf` (+ outline `.svg` preview) |
-| Illustrator/InDesign | `--formats svg,pdf --mode adjoining` | `.svg` (groups per colour, ids `color-NN-HEX`), `.pdf` |
+| Illustrator/InDesign | `--formats svg,pdf --mode adjoining` | `.svg` (groups per colour, ids `color-NN-HEX`, gradient groups `gradient-NN`), `.pdf` |
+
+Gradients in each format: SVG `linearGradient` / `radialGradient` (userSpaceOnUse, editable stops),
+PDF axial / radial shading, EPS PostScript Level 3 `shfill`. DXF carries outlines only. A CMYK map
+applies to flat colours; gradient stops stay RGB — say so when print + CMYK + gradients meet.
 
 Modes:
 - **stacked** — largest regions painted first; a hole is left out when the shape filling it is painted
@@ -115,7 +125,8 @@ what you changed. Edge errors in the heatmap are normal (anti-aliasing is resamp
 
 Send the output files with SendUserFile (display: attach) plus the preview PNG (render). Then a short
 summary in the user's language: category, palette (hex list), segment mix from `segments`
-(L lines, A arcs, C curves, CIRCLE, ELLIPSE), the two verify numbers, and anything that fell short.
+(L lines, A arcs, C curves, CIRCLE, ELLIPSE), gradients from `gradients` (type, angle or centre,
+stop count, how many shapes share it), the two verify numbers, and anything that fell short.
 No step-by-step recap.
 
 ## Known limits (state them only when relevant)
@@ -124,6 +135,8 @@ No step-by-step recap.
 - Photos become posterised art; for a faithful look raise `--colors` (24–40).
 - Heavily blurred or upscaled sources lose corner sharpness; the engine widens its tolerance to the
   measured edge blur, so geometry stays clean but tight corners may soften.
-- No symmetry enforcement yet; no gradient meshes.
+- No symmetry enforcement yet; no gradient meshes (free-form metal reflections are approximated by
+  the best linear/radial fit, possibly split across a few shapes).
+- EPS gradients (`shfill`) have not been render-checked in a PostScript interpreter yet.
 - Working resolution is capped (logo/lineart ≈ 8 MP, illustration ≈ 6 MP, photo ≈ 2 MP after the
   internal upscale); very large inputs are processed at 1×.

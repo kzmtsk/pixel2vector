@@ -6,6 +6,7 @@ usage:
                        [--category logo|illustration|lineart|photo] [--colors N]
                        [--background auto|keep|remove] [--precision high|normal|low]
                        [--width-mm MM] [--cmyk-map map.json] [--name BASENAME] [--no-verify]
+                       [--gradients auto|on|off]
 
 cmyk-map JSON: {"#1A2B3C": [100, 60, 0, 20], ...}  (palette hex -> C,M,Y,K percent; read report palette first)
 """
@@ -30,6 +31,7 @@ def main():
     ap.add_argument("--precision", default="normal", choices=["high", "normal", "low"])
     ap.add_argument("--width-mm", type=float)
     ap.add_argument("--cmyk-map")
+    ap.add_argument("--gradients", default="auto", choices=["auto", "on", "off"])
     ap.add_argument("--name")
     ap.add_argument("--no-verify", action="store_true")
     a = ap.parse_args()
@@ -43,7 +45,7 @@ def main():
             cmyk = json.load(f)
     rep = run(a.image, a.out, formats=fmts, mode=a.mode, category=a.category, colors=a.colors,
               background=a.background, precision=a.precision, cmyk=cmyk, width_mm=a.width_mm,
-              basename=a.name, do_verify=not a.no_verify, log=lambda m: print(m, file=sys.stderr))
+              basename=a.name, gradients=a.gradients, do_verify=not a.no_verify, log=lambda m: print(m, file=sys.stderr))
     print(json.dumps(rep, indent=2, ensure_ascii=False))
 
 
