@@ -478,6 +478,112 @@ def reduce_anchors(segs, tol, closed, max_kink_deg=25.0):
     return segs
 
 
+# ---------------------------------------------------------------- Illustrator-style anchors
+def _seg_len(sg):
+    S = _sample(sg, 16)
+    return float(np.hypot(*np.diff(S, axis=0).T).sum())
+
+
+def _extrema(S, min_gap, min_amp=0.6):
+    """Indices where the curve turns in x or in y (horizontal/vertical tangent), with hysteresis so
+    pixel noise does not create extrema."""
+    out = []
+    for c in (0, 1):
+        v = S[:, c]
+        last_i, last_v, direction = 0, v[0], 0
+        for i in range(1, len(v)):
+            d = v[i] - last_v
+            if direction >= 0 and d > 0:
+                last_i, last_v, direction = i, v[i], 1
+            elif direction <= 0 and d < 0:
+                last_i, last_v, direction = i, v[i], -1
+            elif abs(d) >= min_amp:
+                # reversed by more than min_amp: the previous max/min was a real extremum
+                if 0 < last_i < len(v) - 1:
+                    out.append(last_i)
+                last_i, last_v, direction = i, v[i], -direction
+    out = sorted(set(out))
+    kept = []
+    for i in out:
+        if i < min_gap or i > len(S) - 1 - min_gap:
+            continue
+        if kept and i - kept[-1] < min_gap:
+            continue
+        kept.append(i)
+    return kept
+
+
+def _axis_tangent(S, i, k=3):
+    d = S[min(len(S) - 1, i + k)] - S[max(0, i - k)]
+    if abs(d[0]) >= abs(d[1]):
+        return np.array([math.copysign(1.0, d[0]), 0.0])
+    return np.array([0.0, math.copysign(1.0, d[1])])
+
+
+def _shift_start(sg, p):
+    d = p - sg[1]
+    if sg[0] == "L":
+        return ("L", p.copy(), sg[2])
+    if sg[0] == "C":
+        return ("C", p.copy(), sg[2] + d, sg[3], sg[4])
+    return None
+
+
+def drop_tiny(segs, min_len):
+    """Remove near-duplicate anchors: a segment shorter than min_len is absorbed by its successor
+    (whose start moves onto the tiny segment's start, so the outline stays closed and pinned ends
+    stay put)."""
+    if len(segs) < 2 or segs[0][0] in ("CIRCLE", "ELLIPSE"):
+        return segs
+    out = list(segs)
+    i = 0
+    while i < len(out) - 1 and len(out) > 1:
+        sg = out[i]
+        if sg[0] in ("L", "C") and _seg_len(sg) < min_len:
+            nxt = _shift_start(out[i + 1], sg[1]) if out[i + 1][0] in ("L", "C") else None
+            if nxt is not None:
+                out[i:i + 2] = [nxt]
+                continue
+        i += 1
+    return out
+
+
+def restyle(segs, tol, s, closed, extrema=True, corner_deg=25.0):
+    """Re-anchor smooth stretches the way type designers and Illustrator users expect: an anchor at
+    every horizontal/vertical extreme of the curve with an axis-aligned handle, as few anchors as
+    possible in between. Corners and straight lines are kept as they are."""
+    if not segs or segs[0][0] in ("CIRCLE", "ELLIPSE"):
+        return segs
+    lim = math.cos(math.radians(corner_deg))
+    # split into smooth stretches at corners
+    stretches, cur = [], [segs[0]]
+    for a, b in zip(segs[:-1], segs[1:]):
+        if float(_fwd_end(a) @ _fwd_start(b)) < lim:
+            stretches.append(cur)
+            cur = [b]
+        else:
+            cur.append(b)
+    stretches.append(cur)
+    out = []
+    for st in stretches:
+        if all(sg[0] == "L" for sg in st):
+            out += st
+            continue
+        pts = [_sample(sg, max(8, int(_seg_len(sg) / 0.75))) for sg in st]
+        S = np.vstack([pts[0]] + [p[1:] for p in pts[1:]])
+        t_start, t_end = _fwd_start(st[0]), -_fwd_end(st[-1])
+        ex = _extrema(S, max(6, int(round(10 * s)))) if extrema else []
+        cuts = [0] + ex + [len(S) - 1]
+        for a, b in zip(cuts[:-1], cuts[1:]):
+            Q = S[a:b + 1].copy()
+            ta = t_start if a == 0 else _axis_tangent(S, a)
+            tb = t_end if b == len(S) - 1 else -_axis_tangent(S, b)
+            if b > 0 and b < len(S) - 1:
+                Q[-1] = S[b]
+            out += _fit_greedy(Q, tol, ta, tb)
+    return out
+
+
 # ---------------------------------------------------------------- whole-shape tests
 def fit_circle_loop(P, tol):
     if len(P) < 12:
@@ -804,7 +910,19 @@ def _fit_cornered(pieces, closed, s, tol, sigma):  # noqa: C901
     return segs
 
 
-def fit_chain(chain, s, tol, sigma, allow_primitives=True, corner_angle=40.0):
+def fit_chain(chain, s, tol, sigma, allow_primitives=True, corner_angle=40.0, anchor_style="minimal"):
+    _fit_chain(chain, s, tol, sigma, allow_primitives, corner_angle)
+    # second pass over each smooth stretch as a whole (between corners): refitting the already
+    # smoothed geometry in one go removes anchors the piecewise first pass could not see
+    if anchor_style == "extrema":
+        chain.segs = restyle(chain.segs, tol * 0.6, s, chain.closed, extrema=True)
+    else:
+        chain.segs = reduce_anchors(restyle(chain.segs, tol * 0.6, s, chain.closed, extrema=False),
+                                    tol * 0.4, chain.closed)
+    chain.segs = drop_tiny(chain.segs, max(1.0, 0.8 * s))
+
+
+def _fit_chain(chain, s, tol, sigma, allow_primitives=True, corner_angle=40.0):
     P = chain.pts
     if chain.closed:
         corners = prune_corners(P, detect_corners(P, True, s, corner_angle), True, s)

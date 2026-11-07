@@ -626,7 +626,9 @@ def _share(grads, s):
             cols = np.vstack([grads[k][2] for k in trial])
             cand = fit_gradient(xy, cols, s, kinds=(gi.kind,))
             parts = sum(grads[k][0].res * len(grads[k][1]) for k in trial) / len(xy)
-            if cand is not None and cand.res <= 1.6 * parts + 2e-4:
+            # accept when the shared gradient is about as good as the parts, or simply good in
+            # absolute terms (rms below ~6/255 per channel): one gradient = one shape, no seam
+            if cand is not None and (cand.res <= 1.6 * parts + 2e-4 or math.sqrt(cand.res / 3) < 0.025):
                 group, joint = trial, cand
         if joint is not None:
             for k in group:
@@ -638,6 +640,22 @@ def _share(grads, s):
 def _unit(v):
     n = float(np.hypot(*v))
     return v / n if n > 1e-12 else np.array([1.0, 0.0])
+
+
+def _is_blend(px, cols, tol=0.06, share=0.7):
+    if len(cols) == 0:
+        return False
+    if len(px) > 3000:
+        px = px[np.random.default_rng(0).choice(len(px), 3000, replace=False)]
+    best = np.full(len(px), 9.0)
+    for i in range(len(cols)):
+        best = np.minimum(best, np.linalg.norm(px - cols[i], axis=1))
+        for j in range(i + 1, len(cols)):
+            A, B = cols[i], cols[j]
+            ab = B - A
+            t = np.clip(((px - A) @ ab) / max(float(ab @ ab), 1e-9), 0, 1)
+            best = np.minimum(best, np.linalg.norm(px - (A + t[:, None] * ab), axis=1))
+    return float((best < tol).mean()) >= share
 
 
 def merge_fragments(comp, clab, carea, grads, rgb, lab, s, amin_src=80.0, de_max=20.0,
@@ -664,10 +682,12 @@ def merge_fragments(comp, clab, carea, grads, rgb, lab, s, amin_src=80.0, de_max
     bounds = np.searchsorted(comp.ravel()[order], np.arange(n + 1))
     ys_all, xs_all = np.unravel_index(order, comp.shape)
     mean_lab = np.zeros((n, 3))
+    mean_rgb = np.zeros((n, 3))
     for i in range(n):
         ys, xs = ys_all[bounds[i]:bounds[i + 1]], xs_all[bounds[i]:bounds[i + 1]]
         if len(ys):
             mean_lab[i] = lab[ys, xs].mean(0)
+            mean_rgb[i] = rgb[ys, xs].mean(0)
     perim = np.zeros(n)
     for k, cnt in pairs.items():
         x, y = divmod(k, n)
@@ -680,11 +700,18 @@ def merge_fragments(comp, clab, carea, grads, rgb, lab, s, amin_src=80.0, de_max
         # hair-thin rims along a gradient shape (JPEG ringing, bevel glints) count as fragments
         # whatever their length: mean width = 2 * area / perimeter
         width_src = 2.0 * carea[o] / max(perim[o], 1) / s
-        rim = width_src < rim_width_src and any(clab[q] in grads for q in nb[o])
+        ys, xs = ys_all[bounds[o]:bounds[o + 1]], xs_all[bounds[o]:bounds[o + 1]]
+        rim = False
+        if width_src < rim_width_src and len(ys):
+            if any(clab[q] in grads for q in nb[o]):
+                rim = True
+            else:
+                # a hair-thin sliver between flat shapes is noise only if its colour is a blend of
+                # its neighbours (anti-aliasing / JPEG); a hairline of its own colour is artwork
+                rim = _is_blend(rgb[ys, xs], [mean_rgb[q] for q in nb[o] if clab[q] >= 0])
         if carea[o] >= amin and not rim:
             continue
         lim = de_rim if rim else de_max
-        ys, xs = ys_all[bounds[o]:bounds[o + 1]], xs_all[bounds[o]:bounds[o + 1]]
         if len(ys) == 0:
             continue
         best = None

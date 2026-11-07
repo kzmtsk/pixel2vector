@@ -10,8 +10,10 @@ colour regions is stored once and referenced by both neighbours, so shapes meet 
 gaps, no overlaps) and a cutter traces each edge once. Geometry is fitted with a primitive ladder —
 straight line → tangent fillet / circular arc → cubic Bézier — plus whole-shape circle and ellipse
 detection, corner detection with least-squares corner placement, minimum anchor points (each curve is
-extended as far as one Bézier stays within tolerance, smooth joints are merged, insignificant corners
-and hair-thin fragments are dropped), and sub-pixel boundaries recovered
+extended as far as one Bézier stays within tolerance, every smooth stretch between corners is refitted
+as a whole, smooth joints are merged, insignificant corners, near-duplicate anchors, low-contrast
+fragments and blend-coloured hair-thin slivers are dropped — hairlines of their own colour are kept),
+and sub-pixel boundaries recovered
 from anti-aliasing (the source is upscaled before quantisation). Smooth colour transitions are
 rebuilt as real gradients — linear at any angle or radial at any centre, any number of stops, one
 gradient per shape or one shared across several shapes — instead of being posterised into bands.
@@ -80,7 +82,12 @@ after seeing the palette from the first run, via `--cmyk-map`.
 | Web | `--formats svg --mode stacked` | `.svg` |
 | Print | `--formats pdf,eps --mode stacked [--width-mm W] [--cmyk-map M]` | `.pdf`, `.eps` |
 | Cutting | `--formats dxf,svg --mode outline --background remove [--width-mm W]` | `.dxf` (+ outline `.svg` preview) |
-| Illustrator/InDesign | `--formats svg,pdf --mode adjoining` | `.svg` (groups per colour, ids `color-NN-HEX`, gradient groups `gradient-NN`), `.pdf` |
+| Illustrator/InDesign | `--formats svg,pdf --mode adjoining --anchors extrema` | `.svg` (groups per colour, ids `color-NN-HEX`, gradient groups `gradient-NN`), `.pdf` |
+
+Anchor styles: `--anchors minimal` (default) gives the fewest anchor points the tolerance allows.
+`--anchors extrema` puts an anchor at every horizontal/vertical extreme of a curve with an
+axis-aligned handle (the type-design / Illustrator convention, easiest to edit by hand) and as few as
+possible in between; it costs a few more anchors. Use extrema whenever the user will edit the paths.
 
 Gradients in each format: SVG `linearGradient` / `radialGradient` (userSpaceOnUse, editable stops),
 PDF axial / radial shading, EPS PostScript Level 3 `shfill`. DXF carries outlines only. A CMYK map
@@ -102,7 +109,8 @@ Run:
 
 ```bash
 python3 $ENGINE/vectorize.py INPUT --out OUTDIR --name BASENAME --formats ... --mode ... \
-  [--category C] [--colors N] [--background keep|remove] [--precision high|normal|low]
+  [--category C] [--colors N] [--background keep|remove] [--precision high|normal|low] \
+  [--gradients auto|on|off] [--anchors minimal|extrema]
 ```
 
 stdout is the JSON report (also saved as `BASENAME_report.json`); progress goes to stderr.

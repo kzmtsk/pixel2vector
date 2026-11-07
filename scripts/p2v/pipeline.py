@@ -58,7 +58,7 @@ def detect_background(labels):
 
 
 def run(path, out_dir, formats=("svg",), mode="stacked", category=None, colors=None,
-        background="auto", precision="normal", cmyk=None, width_mm=None, basename=None, gradients="auto",
+        background="auto", precision="normal", cmyk=None, width_mm=None, basename=None, gradients="auto", anchors="minimal",
         do_verify=True, log=print):
     t0 = time.time()
     rgba, has_alpha = load_rgba(path)
@@ -94,12 +94,14 @@ def run(path, out_dir, formats=("svg",), mode="stacked", category=None, colors=N
         comp, clab, carea, palette, grads = detect_gradients(comp, clab, carea, palette, pal_lab,
                                                              work_lab, work_rgb, s, band)
         if grads:
-            # edge refinement re-classifies pixels: restore connectivity and drop specks,
-            # then fold low-contrast fragments into their neighbours (each fragment = extra outline)
+            # edge refinement re-classifies pixels: restore connectivity and drop specks
             labels = despeckle(clab[comp].astype(np.int32), min_area)
             comp, clab, carea = components(labels)
-            comp, clab, carea = merge_fragments(comp, clab, carea, grads, work_rgb, work_lab, s)
-            comp, clab, carea = components(clab[comp].astype(np.int32))
+    if cat != "photo":
+        # minimum feature size (all artwork): low-contrast fragments and blend-coloured hair-thin
+        # slivers join their neighbours; each would otherwise cost a whole extra outline of anchors
+        comp, clab, carea = merge_fragments(comp, clab, carea, grads, work_rgb, work_lab, s)
+        comp, clab, carea = components(clab[comp].astype(np.int32))
     t1 = time.time()
     chains = build_graph(comp)
     t2 = time.time()
@@ -109,7 +111,7 @@ def run(path, out_dir, formats=("svg",), mode="stacked", category=None, colors=N
     tol = max(tol, 0.22 * band * pf)
     sigma = max(sigma, 0.45 * band)
     for ch in chains:
-        fit_chain(ch, s_eff, tol, sigma, allow_primitives=prims, corner_angle=cdeg)
+        fit_chain(ch, s_eff, tol, sigma, allow_primitives=prims, corner_angle=cdeg, anchor_style=anchors)
     t3 = time.time()
     regions = assemble(chains, clab, carea)
 
@@ -154,7 +156,7 @@ def run(path, out_dir, formats=("svg",), mode="stacked", category=None, colors=N
         "input": os.path.basename(path),
         "analysis": info,
         "used": {"category": cat, "colors": int(len(palette)), "scale": s, "mode": mode,
-                 "background": background, "precision": precision,
+                 "background": background, "precision": precision, "anchor_style": anchors,
                  "tolerance_src_px": round(tol / s, 3), "edge_band_src_px": round(band / s, 2)},
         "palette": [to_hex(c) for c in palette],
         "dropped_colors": [to_hex(palette[l]) for l in dropped],
