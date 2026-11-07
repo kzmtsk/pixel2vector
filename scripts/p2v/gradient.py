@@ -181,11 +181,25 @@ def absorb_fringes(comp, clab, carea, rgb, rad, blend_tol=0.06):
                 best = np.minimum(best, np.linalg.norm(px - (A + t[:, None] * ab), axis=1))
         if float((best < blend_tol).mean()) < 0.7:
             continue
-        counts = dict(zip(*np.unique(nb, return_counts=True)))
-        target = max(vals, key=lambda v: counts.get(v, 0))
-        sub[m] = target
-        cnt[target] += cnt[c]
+        # mark as fringe; pixels are re-assigned individually below (watershed on the source),
+        # so the boundary follows the real edge instead of jumping sliver by sliver
+        sub[m] = -3
         cnt[c] = 0
+    fr = comp == -3
+    if fr.any():
+        markers = np.where(fr, 0, comp + 1).astype(np.int32)
+        img = np.ascontiguousarray(np.clip(rgb * 255, 0, 255).astype(np.uint8))
+        cv2.watershed(img, markers)
+        # watershed lines (-1) and any leftovers take a neighbouring basin
+        k3 = np.ones((3, 3), np.uint8)
+        for _ in range(4):
+            hole = markers <= 0
+            if not hole.any():
+                break
+            dil = cv2.dilate(np.where(hole, 0, markers).astype(np.float32), k3).astype(np.int32)
+            markers = np.where(hole, dil, markers)
+        comp = np.where(fr | (markers <= 0) & fr, markers - 1, comp)
+        comp[comp < 0] = 0
     # compact ids
     used = np.unique(comp)
     remap = np.full(n, -1, np.int64)
@@ -284,7 +298,7 @@ def _stops(means, cnt, tol):
     return stops
 
 
-def fit_gradient(xy, cols, s, stop_tol=0.018, min_std=0.025, gain=0.45):
+def fit_gradient(xy, cols, s, stop_tol=0.018, min_std=0.025, gain=0.45, kinds=("linear", "radial")):
     """xy: (N,2) working-px coordinates, cols: (N,3) sRGB 0..1. Returns Gradient or None (flat)."""
     if len(xy) < 50:
         return None
@@ -297,8 +311,8 @@ def fit_gradient(xy, cols, s, stop_tol=0.018, min_std=0.025, gain=0.45):
         return None
     ext = float(np.hypot(*(xy.max(0) - xy.min(0))))
     nb = int(np.clip(ext / (2.0 * s), 16, 256))
-    lin_res, u = _linear_search(xy, cols, nb)
-    rad_res, c = _radial_search(xy, cols, nb)
+    lin_res, u = _linear_search(xy, cols, nb) if "linear" in kinds else (1e9, None)
+    rad_res, c = _radial_search(xy, cols, nb) if "radial" in kinds else (1e9, None)
     if rad_res < 0.8 * lin_res:
         kind, res = "radial", rad_res
         t = np.hypot(*(xy - c).T)
@@ -371,7 +385,71 @@ def detect(comp, clab, carea, palette, pal_lab, lab, rgb, s, band):
     grads = _share(grads, s)
     comp2, clab2, carea2 = _absorb_orphans(comp2, clab2, carea2, grads, rgb, ys_all, xs_all, bounds)
     comp2, clab2, carea2 = _fuse_same_gradient(comp2, clab2, grads)
+    if grads:
+        comp2, clab2, carea2 = refine_edges(comp2, clab2, grads, rgb, ero)
     return comp2, clab2, carea2, np.array(pal, np.float32), grads
+
+
+def refine_edges(comp, clab, grads, rgb, d):
+    """Re-place the outline of every gradient shape at the 50 % coverage line.
+
+    Band-wise quantisation puts the edge of a gradient shape at a different threshold in every band
+    (a bright band meets black at another point than a dark band does), which shows as steps along
+    the outline. Near each edge between a gradient shape G and a flat shape F, every pixel is
+    re-classified with a two-colour coverage model: the gradient's own predicted colour at that
+    position versus F's colour. The pixel goes to G when it is at least half G. The outline then
+    follows the real edge continuously. Thin shapes keep their core."""
+    H, W = comp.shape
+    n = len(clab)
+    is_grad = np.array([clab[i] in grads for i in range(n)])
+    # pairs (gradient comp, flat comp) that touch, and the edge pixels per pair
+    pair_px = {}
+    for a, b, sa, sb in ((comp[:, :-1], comp[:, 1:], (slice(None), slice(None, -1)), (slice(None), slice(1, None))),
+                         (comp[:-1, :], comp[1:, :], (slice(None, -1), slice(None)), (slice(1, None), slice(None)))):
+        m = (a != b) & (is_grad[a] ^ is_grad[b]) & (clab[a] >= 0) & (clab[b] >= 0)
+        ys, xs = np.nonzero(m)
+        ga, gb = a[ys, xs], b[ys, xs]
+        G = np.where(is_grad[ga], ga, gb)
+        F = np.where(is_grad[ga], gb, ga)
+        for gg, ff, y, x in zip(G.tolist(), F.tolist(), ys.tolist(), xs.tolist()):
+            pair_px.setdefault((gg, ff), []).append((y, x))
+    if not pair_px:
+        return comp, clab, np.bincount(comp.ravel(), minlength=n).astype(np.int64)
+    bnd = np.zeros((H, W), bool)
+    bnd[:, :-1] |= comp[:, :-1] != comp[:, 1:]
+    bnd[:, 1:] |= comp[:, :-1] != comp[:, 1:]
+    bnd[:-1, :] |= comp[:-1, :] != comp[1:, :]
+    bnd[1:, :] |= comp[:-1, :] != comp[1:, :]
+    dist = cv2.distanceTransform((~bnd).astype(np.uint8), cv2.DIST_L2, 3)
+    thick = np.zeros(n, np.float32)
+    np.maximum.at(thick, comp.ravel(), dist.ravel())
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * d + 1, 2 * d + 1))
+    flat_col = {}
+    out = comp.copy()
+    for (gg, ff), pts in pair_px.items():
+        pts = np.array(pts)
+        y0, x0 = max(0, pts[:, 0].min() - d - 2), max(0, pts[:, 1].min() - d - 2)
+        y1, x1 = min(H, pts[:, 0].max() + d + 3), min(W, pts[:, 1].max() + d + 3)
+        e = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        e[pts[:, 0] - y0, pts[:, 1] - x0] = 1
+        near = cv2.dilate(e, ker) > 0
+        sc = comp[y0:y1, x0:x1]
+        sel = near & ((sc == gg) | (sc == ff)) & (dist[y0:y1, x0:x1] < np.minimum(d, 0.5 * thick[sc]))
+        ys, xs = np.nonzero(sel)
+        if len(ys) == 0:
+            continue
+        ys, xs = ys + y0, xs + x0
+        if ff not in flat_col:
+            fm = (comp == ff) & (dist >= d)
+            flat_col[ff] = rgb[fm].mean(0) if fm.any() else rgb[comp == ff].mean(0)
+        Fc = flat_col[ff][None, :]
+        xy = np.stack([xs + 0.5, ys + 0.5], 1).astype(np.float64)
+        Gc = grads[clab[gg]].eval(xy)
+        c = rgb[ys, xs].astype(np.float64)
+        ab = Gc - Fc
+        t = ((c - Fc) * ab).sum(1) / np.maximum((ab * ab).sum(1), 1e-9)
+        out[ys, xs] = np.where(t >= 0.5, gg, ff)
+    return out, clab, np.bincount(out.ravel(), minlength=n).astype(np.int64)
 
 
 def _fuse_same_gradient(comp, clab, grads):
@@ -479,16 +557,17 @@ def _interior(comp, g, ys, xs, e):
 
 
 def _share(grads, s):
-    """Try one shared gradient across shapes whose individual gradients are alike."""
-    items = list(grads.items())
+    """Grow shared gradients greedily: a shape joins a group when one gradient still fits the union
+    about as well as the separate gradients did. Largest shapes seed first."""
+    items = sorted(grads.items(), key=lambda kv: -len(kv[1][1]))
     out = {k: v[0] for k, v in items}
     used = set()
-    for i, (ki, (gi, xyi, ci)) in enumerate(items):
+    for ki, (gi, xyi, ci) in items:
         if ki in used:
             continue
-        group = [ki]
-        for kj, (gj, xyj, cj) in items[i + 1:]:
-            if kj in used or gi.kind != gj.kind:
+        group, joint = [ki], None
+        for kj, (gj, xyj, cj) in items:
+            if kj in used or kj in group or gi.kind != gj.kind:
                 continue
             if gi.kind == "radial" and np.hypot(*(gi.center - gj.center)) > 0.15 * max(gi.radius, gj.radius):
                 continue
@@ -497,14 +576,14 @@ def _share(grads, s):
                 uj = _unit(gj.p1 - gj.p0)
                 if abs(float(ui @ uj)) < math.cos(math.radians(8)):
                     continue
-            group.append(kj)
-        if len(group) < 2:
-            continue
-        xy = np.vstack([grads[k][1] for k in group])
-        cols = np.vstack([grads[k][2] for k in group])
-        joint = fit_gradient(xy, cols, s)
-        parts = sum(grads[k][0].res * len(grads[k][1]) for k in group) / len(xy)
-        if joint is not None and joint.res <= 1.6 * parts + 2e-4:
+            trial = group + [kj]
+            xy = np.vstack([grads[k][1] for k in trial])
+            cols = np.vstack([grads[k][2] for k in trial])
+            cand = fit_gradient(xy, cols, s, kinds=(gi.kind,))
+            parts = sum(grads[k][0].res * len(grads[k][1]) for k in trial) / len(xy)
+            if cand is not None and cand.res <= 1.6 * parts + 2e-4:
+                group, joint = trial, cand
+        if joint is not None:
             for k in group:
                 out[k] = joint
                 used.add(k)

@@ -79,6 +79,10 @@ def run(path, out_dir, formats=("svg",), mode="stacked", category=None, colors=N
         pal_lab = rgb_to_lab(np.asarray(palette, np.float32).reshape(-1, 1, 3)).reshape(-1, 3)
         comp, clab, carea, palette, grads = detect_gradients(comp, clab, carea, palette, pal_lab,
                                                              work_lab, work_rgb, s, band)
+        if grads:
+            # edge refinement re-classifies pixels: restore connectivity and drop specks
+            labels = despeckle(clab[comp].astype(np.int32), min_area)
+            comp, clab, carea = components(labels)
     t1 = time.time()
     chains = build_graph(comp)
     t2 = time.time()
