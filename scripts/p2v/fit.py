@@ -90,6 +90,37 @@ def _turn(P, i, k, closed):
     return math.acos(max(-1.0, min(1.0, c)))
 
 
+def prune_corners(P, corners, closed, s, min_len_px=None, keep_deg=110.0):
+    """Drop corners that only bound a tiny piece (pixel stairs, JPEG noise): every corner costs
+    anchors, so a corner must earn its place with legs of real length, unless it is very sharp."""
+    if len(corners) < 2 and not (not closed and corners):
+        return corners
+    n = len(P)
+    k = max(3, int(round(3 * s)))
+    Lmin = min_len_px if min_len_px is not None else 2.5 * s
+    seg_len = np.r_[0, np.cumsum(np.hypot(*np.diff(P, axis=0).T))]
+    total = seg_len[-1] + (math.hypot(*(P[0] - P[-1])) if closed else 0)
+    cs = list(corners)
+    changed = True
+    while changed and cs:
+        changed = False
+        ang = {c: _turn(P, c, k, closed) for c in cs}
+        bounds = cs if closed else [0] + cs + [n - 1]
+        for idx in range(len(bounds) - (0 if closed else 1)):
+            a, b = bounds[idx], bounds[(idx + 1) % len(bounds)]
+            L = (seg_len[b] - seg_len[a]) if b > a else (total - seg_len[a] + seg_len[b])
+            if L >= Lmin:
+                continue
+            cand = [c for c in (a, b) if c in ang and math.degrees(ang[c]) < keep_deg]
+            if not cand:
+                continue
+            drop = min(cand, key=lambda c: ang[c])
+            cs.remove(drop)
+            changed = True
+            break
+    return cs
+
+
 def detect_corners(P, closed, s, angle_deg=50.0):
     n = len(P)
     k = max(3, int(round(3 * s)))
@@ -310,16 +341,141 @@ def fit_piece(P, tol, t0=None, t1=None, depth=0):
         return [seg]
     if n <= 4 or depth > 24:
         return [("L", P[i].copy(), P[i + 1].copy()) for i in range(n - 1)]
-    c0 = t0 if t0 is not None else _tangent_start(P)
-    c1 = t1 if t1 is not None else _tangent_end(P)
-    ctrl, err, idx = fit_cubic(P, c0, c1, tol)
-    if err <= tol:
-        return [("C", ctrl[0].copy(), ctrl[1], ctrl[2], ctrl[3].copy())]
-    idx = min(max(idx, 2), n - 3)
-    tc = _unit(P[idx - 1] - P[idx + 1])  # points backward along the curve
-    left = fit_piece(P[:idx + 1], tol, t0, tc, depth + 1)
-    right = fit_piece(P[idx:], tol, -tc, t1, depth + 1)
-    return left + right
+    return _fit_greedy(P, tol, t0, t1)
+
+
+def _cubic_ok(P, t0, t1, tol):
+    ctrl, err, _ = fit_cubic(P, t0, t1, tol)
+    return ctrl, err <= tol
+
+
+def _tan_back_at(P, j, k=4):
+    """Backward unit tangent at index j (points against the direction of travel)."""
+    a = max(0, j - k)
+    b = min(len(P) - 1, j + k)
+    return _unit(P[a] - P[b])
+
+
+def _fit_greedy(P, tol, t0=None, t1=None):
+    """Fewest cubic segments: from each start, extend the segment as far as one cubic stays within
+    tolerance (exponential then binary search), then continue G1 from its end tangent."""
+    n = len(P)
+    segs = []
+    i = 0
+    tin = t0 if t0 is not None else _tangent_start(P)
+    while i < n - 1:
+        rest = P[i:]
+        tend = t1 if t1 is not None else _tangent_end(rest)
+        ctrl, ok = _cubic_ok(rest, tin, tend, tol)
+        if ok:
+            segs.append(("C", ctrl[0].copy(), ctrl[1], ctrl[2], ctrl[3].copy()))
+            break
+        lo, hi = i + 1, n - 1          # lo: known fit (2 points always fit), hi: known failure
+        best = None
+        step = 4
+        probe = min(i + step, hi - 1)
+        while probe > lo:
+            ctrl, ok = _cubic_ok(P[i:probe + 1], tin, _tan_back_at(P, probe), tol)
+            if ok:
+                lo, best = probe, ctrl
+                step *= 2
+                probe = min(i + step, hi - 1)
+                if probe <= lo:
+                    break
+            else:
+                hi = probe
+                break
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            ctrl, ok = _cubic_ok(P[i:mid + 1], tin, _tan_back_at(P, mid), tol)
+            if ok:
+                lo, best = mid, ctrl
+            else:
+                hi = mid
+        j = lo
+        if best is None:
+            segs.append(("L", P[i].copy(), P[j].copy()))
+            tin = _unit(P[j] - P[i])
+        else:
+            segs.append(("C", best[0].copy(), best[1], best[2], best[3].copy()))
+            tin = -_tan_back_at(P, j)
+        i = j
+    return segs
+
+
+# ---------------------------------------------------------------- anchor reduction
+def _sample(sg, k=24):
+    t = sg[0]
+    if t == "L":
+        return np.linspace(sg[1], sg[2], k)
+    if t == "C":
+        u = np.linspace(0, 1, k)
+        return _bez([sg[1], sg[2], sg[3], sg[4]], u)
+    if t == "A":
+        _, p0, p1, c, R, a0, sw = sg
+        a = a0 + np.linspace(0, 1, k) * sw
+        return np.stack([c[0] + R * np.cos(a), c[1] + R * np.sin(a)], 1)
+    return None
+
+
+def _fwd_start(sg):
+    if sg[0] == "C":
+        v = sg[2] - sg[1]
+        if math.hypot(*v) < 1e-9:
+            v = sg[3] - sg[1]
+        return _unit(v)
+    if sg[0] == "L":
+        return _unit(sg[2] - sg[1])
+    f0, _ = _seg_tangents(sg)
+    return f0
+
+
+def _fwd_end(sg):
+    if sg[0] == "C":
+        v = sg[4] - sg[3]
+        if math.hypot(*v) < 1e-9:
+            v = sg[4] - sg[2]
+        return _unit(v)
+    if sg[0] == "L":
+        return _unit(sg[2] - sg[1])
+    _, b = _seg_tangents(sg)
+    return -b
+
+
+def reduce_anchors(segs, tol, closed, max_kink_deg=25.0):
+    """Merge neighbouring segments into one cubic wherever their joint is smooth (not a corner) and
+    one cubic still follows both within tolerance. Collinear lines merge into one line. Repeats until
+    nothing merges. For closed chains the joint across the start point is merged as well."""
+    if not segs or segs[0][0] in ("CIRCLE", "ELLIPSE"):
+        return segs
+    lim = math.cos(math.radians(max_kink_deg))
+    segs = list(segs)
+    changed = True
+    while changed and len(segs) > 1:
+        changed = False
+        i = 0
+        while i < len(segs) - (0 if closed and len(segs) > 2 else 1):
+            j = (i + 1) % len(segs)
+            a, b = segs[i], segs[j]
+            if float(_fwd_end(a) @ _fwd_start(b)) < lim:
+                i += 1
+                continue
+            if a[0] == "L" and b[0] == "L" and fit_line(np.vstack([_sample(a, 8), _sample(b, 8)[1:]]), tol):
+                merged = ("L", a[1].copy(), b[2].copy())
+            else:
+                pts = np.vstack([_sample(a), _sample(b)[1:]])
+                ctrl, err, _ = fit_cubic(pts, _fwd_start(a), -_fwd_end(b), tol)
+                if err > tol:
+                    i += 1
+                    continue
+                merged = ("C", a[1].copy() if a[0] != "C" else a[1].copy(), ctrl[1], ctrl[2],
+                          (b[2] if b[0] in ("L", "A") else b[4]).copy())
+            if j == 0:  # wrapped joint of a closed chain: merged segment becomes the first
+                segs = [merged] + segs[1:i]
+            else:
+                segs[i:i + 2] = [merged]
+            changed = True
+    return segs
 
 
 # ---------------------------------------------------------------- whole-shape tests
@@ -651,7 +807,7 @@ def _fit_cornered(pieces, closed, s, tol, sigma):  # noqa: C901
 def fit_chain(chain, s, tol, sigma, allow_primitives=True, corner_angle=40.0):
     P = chain.pts
     if chain.closed:
-        corners = detect_corners(P, True, s, corner_angle)
+        corners = prune_corners(P, detect_corners(P, True, s, corner_angle), True, s)
         if not corners:
             S = smooth_closed(P, sigma)
             if allow_primitives:
@@ -669,7 +825,7 @@ def fit_chain(chain, s, tol, sigma, allow_primitives=True, corner_angle=40.0):
                 S = S.copy()
                 S[r0] = c + ((S[r0] - c) @ d) * d
                 Q = np.vstack([S[r0:], S[:r0 + 1]])
-                chain.segs = fit_smooth_piece(Q, tol, s)
+                chain.segs = reduce_anchors(fit_smooth_piece(Q, tol, s), tol * 0.6, True)
                 chain.pts = np.vstack([P[r0:], P[:r0]])
                 return
             n = len(S)
@@ -679,7 +835,8 @@ def fit_chain(chain, s, tol, sigma, allow_primitives=True, corner_angle=40.0):
             second = Q[i1:]
             tA = _unit(S[1] - S[-1])
             tB = _unit(S[i1 + 1] - S[i1 - 1])
-            chain.segs = fit_piece(first, tol, tA, -tB) + fit_piece(second, tol, tB, -tA)
+            chain.segs = reduce_anchors(fit_piece(first, tol, tA, -tB) + fit_piece(second, tol, tB, -tA),
+                                        tol * 0.6, True)
             return
         c0 = corners[0]
         n = len(P)
@@ -687,13 +844,13 @@ def fit_chain(chain, s, tol, sigma, allow_primitives=True, corner_angle=40.0):
         cs = [(c - c0) % n for c in corners] + [n]
         Pc = np.vstack([Pr, Pr[:1]])
         pieces = [Pc[a:b + 1] for a, b in zip(cs[:-1], cs[1:])]
-        chain.segs = _fit_cornered(pieces, True, s, tol, sigma)
+        chain.segs = reduce_anchors(_fit_cornered(pieces, True, s, tol, sigma), tol * 0.6, True)
         chain.pts = Pr
         return
-    corners = detect_corners(P, False, s, corner_angle)
+    corners = prune_corners(P, detect_corners(P, False, s, corner_angle), False, s)
     cuts = [0] + [c for c in corners if 0 < c < len(P) - 1] + [len(P) - 1]
     pieces = [P[a:b + 1] for a, b in zip(cuts[:-1], cuts[1:])]
-    chain.segs = _fit_cornered(pieces, False, s, tol, sigma)
+    chain.segs = reduce_anchors(_fit_cornered(pieces, False, s, tol, sigma), tol * 0.6, False)
 
 
 def reverse_segs(segs):

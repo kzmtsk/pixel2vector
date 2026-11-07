@@ -477,6 +477,51 @@ def _fuse_same_gradient(comp, clab, grads):
     return comp2, clab[used], np.bincount(comp2.ravel(), minlength=len(used)).astype(np.int64)
 
 
+def _absorb_rims(comp, clab, carea, grads, s, max_width_src=1.3):
+    """Hair-thin slivers (mean width under ~1 source pixel) lying along a gradient shape are rim
+    noise (JPEG ringing, bevel glints); each would cost a whole extra outline of anchors. They join
+    the neighbour they share most boundary with."""
+    if not grads:
+        return comp, clab, carea
+    n = len(clab)
+    perim = np.zeros(n)
+    pair_cnt = {}
+    for a, b in ((comp[:, :-1], comp[:, 1:]), (comp[:-1, :], comp[1:, :])):
+        m = a != b
+        aa, bb = a[m], b[m]
+        perim += np.bincount(aa, minlength=n) + np.bincount(bb, minlength=n)
+        keys = np.minimum(aa, bb).astype(np.int64) * n + np.maximum(aa, bb)
+        u, c = np.unique(keys, return_counts=True)
+        for k, cnt in zip(u.tolist(), c.tolist()):
+            pair_cnt[k] = pair_cnt.get(k, 0) + cnt
+    nb = [dict() for _ in range(n)]
+    for k, cnt in pair_cnt.items():
+        x, y = divmod(k, n)
+        nb[x][y] = cnt
+        nb[y][x] = cnt
+    target = np.arange(n)
+    for o in range(n):
+        if clab[o] < 0 or clab[o] in grads:
+            continue
+        width = 2.0 * carea[o] / max(perim[o], 1) / s
+        if width >= max_width_src:
+            continue
+        if not any(clab[q] in grads for q in nb[o]):
+            continue
+        cands = [(cnt, q) for q, cnt in nb[o].items() if clab[q] >= 0]
+        if cands:
+            target[o] = max(cands)[1]
+    for i in range(n):
+        j, hops = i, 0
+        while target[j] != j and hops < n:
+            j = target[j]
+            hops += 1
+        target[i] = j
+    used, inv = np.unique(target, return_inverse=True)
+    comp2 = inv[comp].astype(np.int32)
+    return comp2, clab[used], np.bincount(comp2.ravel(), minlength=len(used)).astype(np.int64)
+
+
 def _absorb_orphans(comp, clab, carea, grads, rgb, ys_all, xs_all, bounds, tol=0.05, max_share=2.0,
                     thin_w=6.0):
     """Small leftover regions inside or along a gradient shape (bits the band merge missed) join the
@@ -593,3 +638,76 @@ def _share(grads, s):
 def _unit(v):
     n = float(np.hypot(*v))
     return v / n if n > 1e-12 else np.array([1.0, 0.0])
+
+
+def merge_fragments(comp, clab, carea, grads, rgb, lab, s, amin_src=80.0, de_max=20.0,
+                    rim_width_src=1.3, de_rim=45.0):
+    """Minimum feature size for gradient artwork: a fragment smaller than amin_src source px whose
+    colour is close (dE < de_max) to a neighbour joins that neighbour. Small details that contrast
+    with everything around them (a dot, a registered mark) stay."""
+    from .imgio import rgb_to_lab
+    n = len(clab)
+    amin = amin_src * s * s
+    pairs = {}
+    for a, b in ((comp[:, :-1], comp[:, 1:]), (comp[:-1, :], comp[1:, :])):
+        m = a != b
+        keys = np.minimum(a[m], b[m]).astype(np.int64) * n + np.maximum(a[m], b[m])
+        u, c = np.unique(keys, return_counts=True)
+        for k, cnt in zip(u.tolist(), c.tolist()):
+            pairs[k] = pairs.get(k, 0) + cnt
+    nb = [dict() for _ in range(n)]
+    for k, cnt in pairs.items():
+        x, y = divmod(k, n)
+        nb[x][y] = cnt
+        nb[y][x] = cnt
+    order = np.argsort(comp, axis=None, kind="stable")
+    bounds = np.searchsorted(comp.ravel()[order], np.arange(n + 1))
+    ys_all, xs_all = np.unravel_index(order, comp.shape)
+    mean_lab = np.zeros((n, 3))
+    for i in range(n):
+        ys, xs = ys_all[bounds[i]:bounds[i + 1]], xs_all[bounds[i]:bounds[i + 1]]
+        if len(ys):
+            mean_lab[i] = lab[ys, xs].mean(0)
+    perim = np.zeros(n)
+    for k, cnt in pairs.items():
+        x, y = divmod(k, n)
+        perim[x] += cnt
+        perim[y] += cnt
+    target = np.arange(n)
+    for o in np.argsort(carea):
+        if clab[o] < 0 or clab[o] in grads:
+            continue
+        # hair-thin rims along a gradient shape (JPEG ringing, bevel glints) count as fragments
+        # whatever their length: mean width = 2 * area / perimeter
+        width_src = 2.0 * carea[o] / max(perim[o], 1) / s
+        rim = width_src < rim_width_src and any(clab[q] in grads for q in nb[o])
+        if carea[o] >= amin and not rim:
+            continue
+        lim = de_rim if rim else de_max
+        ys, xs = ys_all[bounds[o]:bounds[o + 1]], xs_all[bounds[o]:bounds[o + 1]]
+        if len(ys) == 0:
+            continue
+        best = None
+        for q, cnt in nb[o].items():
+            q = int(target[q])
+            if q == o or clab[q] < 0:
+                continue
+            if clab[q] in grads:
+                xy = np.stack([xs + 0.5, ys + 0.5], 1).astype(np.float64)
+                ref = rgb_to_lab(grads[clab[q]].eval(xy).astype(np.float32).reshape(-1, 1, 3)).reshape(-1, 3).mean(0)
+            else:
+                ref = mean_lab[q]
+            de = float(np.linalg.norm(mean_lab[o] - ref))
+            if de < lim and (best is None or (de, -cnt) < best[:2]):
+                best = (de, -cnt, q)
+        if best is not None:
+            target[o] = best[2]
+    for i in range(n):
+        j, hops = i, 0
+        while target[j] != j and hops < n:
+            j = target[j]
+            hops += 1
+        target[i] = j
+    used, inv = np.unique(target, return_inverse=True)
+    comp2 = inv[comp].astype(np.int32)
+    return comp2, clab[used], np.bincount(comp2.ravel(), minlength=len(used)).astype(np.int64)

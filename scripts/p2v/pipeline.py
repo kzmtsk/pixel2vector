@@ -10,7 +10,7 @@ from .imgio import composite, rgb_to_lab
 from .graph import build_graph
 from .fit import fit_chain
 from .model import assemble
-from .gradient import detect as detect_gradients
+from .gradient import detect as detect_gradients, merge_fragments
 from .export import Scene, write_svg, write_pdf, write_eps, write_dxf
 from . import verify
 
@@ -22,6 +22,20 @@ PRESETS = {
     "photo":        (0.90,       1.10,        0.0,               60.0,       False),
 }
 PRECISION = {"high": 0.6, "normal": 1.0, "low": 1.8}
+
+
+def count_anchors(svg_path):
+    """Anchor points as an editor sees them: one per path node; arcs over 90 deg become several."""
+    import re
+    import math
+    s = open(svg_path, encoding="utf-8").read()
+    total = 0
+    for d in re.findall(r' d="([^"]+)"', s):
+        for cmd, args in re.findall(r"([MLCAZ])([^MLCAZ]*)", d):
+            if cmd == "Z":
+                continue
+            total += 1
+    return total
 
 
 def _grad_report(grads, regions, s):
@@ -80,9 +94,12 @@ def run(path, out_dir, formats=("svg",), mode="stacked", category=None, colors=N
         comp, clab, carea, palette, grads = detect_gradients(comp, clab, carea, palette, pal_lab,
                                                              work_lab, work_rgb, s, band)
         if grads:
-            # edge refinement re-classifies pixels: restore connectivity and drop specks
+            # edge refinement re-classifies pixels: restore connectivity and drop specks,
+            # then fold low-contrast fragments into their neighbours (each fragment = extra outline)
             labels = despeckle(clab[comp].astype(np.int32), min_area)
             comp, clab, carea = components(labels)
+            comp, clab, carea = merge_fragments(comp, clab, carea, grads, work_rgb, work_lab, s)
+            comp, clab, carea = components(clab[comp].astype(np.int32))
     t1 = time.time()
     chains = build_graph(comp)
     t2 = time.time()
@@ -144,6 +161,7 @@ def run(path, out_dir, formats=("svg",), mode="stacked", category=None, colors=N
         "graph": {"regions": len([r for r in regions if r.label >= 0]), "chains": len(chains),
                   "nodes_closed_loops": sum(1 for c in chains if c.closed)},
         "segments": scene.stats(),
+        "anchors": count_anchors(svg_path),
         "gradients": _grad_report(grads, regions, s),
         "outputs": outputs,
         "timing_s": {"quantize": round(t1 - t0, 2), "graph": round(t2 - t1, 2),

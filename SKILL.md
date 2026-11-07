@@ -9,7 +9,9 @@ From-scratch vectoriser built around a **shared-boundary Vector Graph**: every b
 colour regions is stored once and referenced by both neighbours, so shapes meet exactly (no hairline
 gaps, no overlaps) and a cutter traces each edge once. Geometry is fitted with a primitive ladder —
 straight line → tangent fillet / circular arc → cubic Bézier — plus whole-shape circle and ellipse
-detection, corner detection with least-squares corner placement, and sub-pixel boundaries recovered
+detection, corner detection with least-squares corner placement, minimum anchor points (each curve is
+extended as far as one Bézier stays within tolerance, smooth joints are merged, insignificant corners
+and hair-thin fragments are dropped), and sub-pixel boundaries recovered
 from anti-aliasing (the source is upscaled before quantisation). Smooth colour transitions are
 rebuilt as real gradients — linear at any angle or radial at any centre, any number of stops, one
 gradient per shape or one shared across several shapes — instead of being posterised into bands.
@@ -125,7 +127,7 @@ what you changed. Edge errors in the heatmap are normal (anti-aliasing is resamp
 
 Send the output files with SendUserFile (display: attach) plus the preview PNG (render). Then a short
 summary in the user's language: category, palette (hex list), segment mix from `segments`
-(L lines, A arcs, C curves, CIRCLE, ELLIPSE), gradients from `gradients` (type, angle or centre,
+(L lines, A arcs, C curves, CIRCLE, ELLIPSE), the anchor-point count (`anchors`), gradients from `gradients` (type, angle or centre,
 stop count, how many shapes share it), the two verify numbers, and anything that fell short.
 No step-by-step recap.
 
